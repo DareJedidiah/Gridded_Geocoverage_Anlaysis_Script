@@ -1,0 +1,215 @@
+import os
+import glob
+import pandas as pd
+import geopandas as gpd
+
+# =====================================================
+# 1. READ GRID EXTENT
+# =====================================================
+grid_path = r"C:\Users\damilare.akindipe\Documents\eHA GIS\Gombe IE Walkthrough 2026\Gombe IE Visitation Analysis\Gombe TA\Final layers\Gombe Gridded TA Main.gpkg"
+print(f"📌 Reading gridded extent from: {grid_path}")
+grided_extent = gpd.read_file(grid_path)
+
+# =====================================================
+# 2. READ VORONOI EXTENT
+# =====================================================
+voronoi_path = r"C:\Users\damilare.akindipe\Documents\eHA GIS\Gombe IE Walkthrough 2026\Gombe IE Visitation Analysis\Gombe TA\Final layers\Gombe Voronoi Extents Main.gpkg"
+print(f"📌 Reading Voronoi extent from: {voronoi_path}")
+voronoi_extent = gpd.read_file(voronoi_path)
+
+# Ensure CRS exists
+if grided_extent.crs is None:
+    grided_extent = grided_extent.set_crs("EPSG:4326")
+if voronoi_extent.crs is None:
+    voronoi_extent = voronoi_extent.set_crs("EPSG:4326")
+
+print("✅ Grid and Voronoi CRS set.")
+
+# =====================================================
+# 3. COMBINE TRACK CSV FILES
+# =====================================================
+folder_path = r"C:\Users\damilare.akindipe\Documents\eHA GIS\Gombe IE Walkthrough 2026\Gombe IE Visitation Analysis\Day 1\Tracks"
+csv_files = glob.glob(os.path.join(folder_path, "*.csv"))
+print(f"📌 Found {len(csv_files)} track CSV files in folder: {folder_path}")
+
+df_list = []
+for file in csv_files:
+    print(f"   - Reading track file: {os.path.basename(file)}")
+    use_cols = ["Lat", "Lon", "Valid", "Speed mps", "NGA State 2024 Label"]
+    df = pd.read_csv(file, usecols=use_cols, engine="python", on_bad_lines="skip")
+    df_list.append(df)
+
+tracks_df = pd.concat(df_list, ignore_index=True)
+print(f"✅ Combined track files. Total rows: {len(tracks_df)}")
+
+# Filter tracks: valid, speed <= 1 m/s, state = Gombe
+tracks_df["Valid"] = pd.to_numeric(tracks_df["Valid"], errors="coerce")
+tracks_df["Speed mps"] = pd.to_numeric(tracks_df["Speed mps"], errors="coerce")
+tracks_df = tracks_df[
+    (tracks_df["Valid"] == 1) &
+    (tracks_df["Speed mps"] <= 1) &
+    (tracks_df["NGA State 2024 Label"].str.strip().str.upper() == "GOMBE")
+][["Lat", "Lon"]].copy()
+
+tracks_df["Lat"] = pd.to_numeric(tracks_df["Lat"], errors="coerce")
+tracks_df["Lon"] = pd.to_numeric(tracks_df["Lon"], errors="coerce")
+tracks_df.dropna(subset=["Lat", "Lon"], inplace=True)
+
+tracks_gdf = gpd.GeoDataFrame(
+    tracks_df,
+    geometry=gpd.points_from_xy(tracks_df["Lon"], tracks_df["Lat"]),
+    crs="EPSG:4326"
+)
+print(f"✅ Filtered and converted track points to GeoDataFrame. Points count: {len(tracks_gdf)}")
+
+# =====================================================
+# 4. READ SUPERVISION DATA
+# =====================================================
+supervision_path = r"C:\Users\damilare.akindipe\Documents\eHA GIS\Gombe IE Walkthrough 2026\Gombe IE Visitation Analysis\Day 1\Supervision Data.csv"
+print(f"📌 Reading supervision data from: {supervision_path}")
+supervision_df = pd.read_csv(supervision_path, encoding='ISO-8859-1', on_bad_lines="skip")
+
+# Keep only Gombe supervision points
+supervision_df["State"] = supervision_df["State"].astype(str).str.strip().str.title()
+supervision_gdf = supervision_df[supervision_df["State"] == "Gombe"].copy()
+
+# Convert to GeoDataFrame using latitude and longitude
+supervision_gdf["latitude"] = pd.to_numeric(supervision_gdf["latitude"], errors="coerce")
+supervision_gdf["longitude"] = pd.to_numeric(supervision_gdf["longitude"], errors="coerce")
+supervision_gdf.dropna(subset=["latitude","longitude"], inplace=True)
+
+supervision_gdf = gpd.GeoDataFrame(
+    supervision_gdf,
+    geometry=gpd.points_from_xy(supervision_gdf["longitude"], supervision_gdf["latitude"]),
+    crs="EPSG:4326"
+)
+print(f"✅ Filtered and converted supervision points to GeoDataFrame. Points count: {len(supervision_gdf)}")
+
+# =====================================================
+# 5. MERGE TRACKS AND SUPERVISION POINTS
+# =====================================================
+all_points_gdf = pd.concat([tracks_gdf, supervision_gdf], ignore_index=True)
+all_points_gdf = all_points_gdf.to_crs(voronoi_extent.crs)
+print(f"✅ Merged track + supervision points. Total points: {len(all_points_gdf)}")
+
+# =====================================================
+# 6. INTERSECT GRIDS WITH ALL POINTS
+# =====================================================
+grided_extent_final = grided_extent.copy()
+grided_extent_final["visitation_status"] = "not_visited"
+
+join = gpd.sjoin(
+    all_points_gdf,
+    grided_extent_final,
+    predicate="intersects",
+    how="left"
+)
+
+counts = join.groupby("index_right").size()
+grided_extent_final.loc[counts.index, "visitation_status"] = "visited"
+print("✅ Gridded extent updated with visitation status using points.")
+
+# Export updated gridded extent
+output_folder = r"C:\Users\damilare.akindipe\Documents\eHA GIS\Gombe IE Walkthrough 2026\Gombe IE Visitation Analysis\Geocoverage Outputs"
+os.makedirs(output_folder, exist_ok=True)
+grided_extent_final.to_file(os.path.join(output_folder, "gridded_extent_with_visitation.gpkg"), driver="GPKG")
+print("✅ Gridded extent exported with visitation status.")
+
+# =====================================================
+# 7. CREATE CENTROIDS FOR VISITED GRIDS
+# =====================================================
+visited_grids = grided_extent_final[grided_extent_final["visitation_status"] == "visited"].copy()
+projected = visited_grids.to_crs(3857)
+projected["geometry"] = projected.geometry.centroid
+centroids = projected.to_crs(voronoi_extent.crs)
+print("✅ Centroids created for visited grids.")
+
+# =====================================================
+# 8. COUNT CENTROIDS IN VORONOI POLYGONS
+# =====================================================
+join = gpd.sjoin(
+    centroids,
+    voronoi_extent,
+    predicate="intersects",
+    how="left"
+)
+
+counts = join.groupby("index_right").size()
+voronoi_extent_final = voronoi_extent.copy()
+voronoi_extent_final["visited_grids"] = 0
+voronoi_extent_final.loc[counts.index, "visited_grids"] = counts.values
+
+# Compute Percent Coverage
+voronoi_extent_final["Percent Coverage"] = (
+    voronoi_extent_final["visited_grids"] / voronoi_extent_final["Total Grids"] * 100
+).round(2)
+
+# Assign visitation status
+voronoi_extent_final["visitation_status"] = voronoi_extent_final["visited_grids"].apply(
+    lambda x: "visited" if x >= 1 else "not_visited"
+)
+
+# =====================================================
+# Compute coverage_type based on Percent Coverage
+# =====================================================
+def coverage_class(percent):
+    if percent == 0:
+        return "Not Visited"
+    elif 0 < percent < 50:
+        return "Poorly Covered"
+    elif 50 <= percent < 80:
+        return "Partially Covered"
+    elif 80 <= percent <= 100:
+        return "Fully Covered"
+    else:
+        return "Unknown"
+
+voronoi_extent_final["coverage_type"] = voronoi_extent_final["Percent Coverage"].apply(coverage_class)
+print("✅ Voronoi polygons updated with visited grid counts, percent coverage, and coverage type.")
+
+# =====================================================
+# 9. EXPORT RESULTS
+# =====================================================
+# Voronoi GeoPackage
+voronoi_extent_final.to_file(
+    os.path.join(output_folder, "voronoi_extent_final.gpkg"),
+    driver="GPKG"
+)
+
+# Voronoi CSV (geometry as WKT)
+export_csv = voronoi_extent_final.copy()
+export_csv["geometry"] = export_csv.geometry.to_wkt()
+export_csv.to_csv(
+    os.path.join(output_folder, "voronoi_extent_final.csv"),
+    index=False
+)
+print("✅ Voronoi results exported to GeoPackage and CSV.")
+
+# =====================================================
+# 10. PRINT VISITATION SUMMARY
+# =====================================================
+print("\n📊 GRID EXTENT VISITATION SUMMARY:")
+total_grids = len(grided_extent_final)
+visited_grids_count = len(grided_extent_final[grided_extent_final["visitation_status"] == "visited"])
+not_visited_grids_count = len(grided_extent_final[grided_extent_final["visitation_status"] == "not_visited"])
+num_track_points = len(tracks_gdf)
+num_supervision_points = len(supervision_gdf)
+total_points = len(all_points_gdf)
+
+print(f"Total grids: {total_grids}")
+print(f"Visited grids: {visited_grids_count} ({visited_grids_count/total_grids*100:.2f}%)")
+print(f"Not visited grids: {not_visited_grids_count} ({not_visited_grids_count/total_grids*100:.2f}%)")
+print(f"Track points (Gombe): {num_track_points}")
+print(f"Supervision points (Gombe): {num_supervision_points}")
+print(f"Total points used for intersection: {total_points}")
+
+print("\n📊 VORONOI GRID VISITATION SUMMARY:")
+total_voronoi = len(voronoi_extent_final)
+visited_voronoi = len(voronoi_extent_final[voronoi_extent_final["visitation_status"] == "visited"])
+not_visited_voronoi = len(voronoi_extent_final[voronoi_extent_final["visitation_status"] == "not_visited"])
+
+print(f"Total Voronoi polygons: {total_voronoi}")
+print(f"Visited Voronoi polygons: {visited_voronoi} ({visited_voronoi/total_voronoi*100:.2f}%)")
+print(f"Not visited Voronoi polygons: {not_visited_voronoi} ({not_visited_voronoi/total_voronoi*100:.2f}%)")
+
+print("\n✅ Processing complete. All grids and Voronoi polygons updated with visitation status and coverage type.")
